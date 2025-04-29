@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AstroLink", "AstroLink\AstroLink.csproj", "{06B548DB-2DDD-4D5E-ACC5-FA769F0607E5}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{06B548DB-2DDD-4D5E-ACC5-FA769F0607E5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{06B548DB-2DDD-4D5E-ACC5-FA769F0607E5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{06B548DB-2DDD-4D5E-ACC5-FA769F0607E5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{06B548DB-2DDD-4D5E-ACC5-FA769F0607E5}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
