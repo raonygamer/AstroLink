@@ -5,6 +5,19 @@
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <RootNamespace>Astro</RootNamespace>
     </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Discord.Net" Version="3.17.4" />
+      <PackageReference Include="MongoDB.Driver" Version="3.3.0" />
+      <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Reference Include="PlayerIOClient">
+        <HintPath>Libraries\PlayerIOClient.dll</HintPath>
+      </Reference>
+    </ItemGroup>
 
 </Project>
