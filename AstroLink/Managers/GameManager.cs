@@ -227,15 +227,23 @@ public class GameManager : IDisposable
     
     private async Task OnServiceDisconnectAsync(object sender, string reason)
     {
-        Log.ErrorLine($"Disconnected from the service room: \n{reason}.");
+        Log.ErrorLine($"Disconnected from the service room: \n    {reason}.");
         await Task.Delay(TimeSpan.FromSeconds(5));
         ServiceConnection?.Disconnect();
         ServiceConnection = null;
-        await ListAndConnectToServiceRoomAsync();
+        try
+        {
+            await ListAndConnectToServiceRoomAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.ErrorLine($"Failed to reconnect to the service room: \n    {ex.Message}.");
+        }
     }
 
     public void Dispose()
     {
+        GC.SuppressFinalize(this);
         ServiceConnection?.Disconnect();
         Client.Logout();
     }

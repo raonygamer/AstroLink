@@ -66,7 +66,7 @@ public class AstroLink
 
     private async Task<int> StartAsync()
     {
-        if (await GetVariables() is not { } variables)
+        if (await GetVariables() is not {} variables)
         {
             Log.ErrorLine($"Variables are not valid: \n{JsonConvert.SerializeObject(Variables, Formatting.Indented)}");
             return 1;
@@ -81,7 +81,7 @@ public class AstroLink
         DatabaseManager = await DatabaseManager.CreateAsync(this, Variables.DatabaseString);
         DiscordManager = await DiscordManager.CreateAsync(this, Variables.DiscordToken);
         GameManager = await GameManager.CreateAsync(this, Variables.GameId, Variables.GameEmail, Variables.GamePassword);
-        LinkingRegistry = new LinkingRegistry(this);
+        LinkingRegistry = new LinkingRegistry(this, DatabaseManager, GameManager, DiscordManager);
         Updater.Tick += async () =>
         {
             LinkingRegistry.CheckLinkingRequests();

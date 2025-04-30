@@ -12,6 +12,7 @@ public class DiscordManager : IDisposable, IAsyncDisposable
     public readonly AstroLink Main;
     public readonly DiscordSocketClient Client;
     public readonly TaskCompletionSource OnReadyCompletion;
+    private readonly Dictionary<ulong, Dictionary<ulong, SocketGuildUser>> UsersCache = [];
     
     private DiscordManager(AstroLink main, DiscordSocketClient client)
     {
@@ -68,6 +69,7 @@ public class DiscordManager : IDisposable, IAsyncDisposable
             {
                 var responseEmbed  = new EmbedBuilder();
                 var database = Main.DatabaseManager;
+                var registry = Main.LinkingRegistry;
                 
                 if (await database.GetUserLinkByDiscordUserIdAsync(command.User.Id) is not {} link)
                 {
@@ -79,7 +81,7 @@ public class DiscordManager : IDisposable, IAsyncDisposable
                     break;
                 }
 
-                await database.RemoveLinkAsync(link);
+                await registry.UnlinkUser(link.DiscordUserId);
                 responseEmbed.WithColor(Color.Green);
                 responseEmbed.WithTitle("Unlinked account");
                 responseEmbed.WithDescription($"Your discord user was unlinked from '{link.GamePlayerId}'.");
@@ -89,35 +91,86 @@ public class DiscordManager : IDisposable, IAsyncDisposable
             }
             case "set-supporter-role":
             {
-                var responseEmbed  = new EmbedBuilder();
+                var embed = new EmbedBuilder();
                 var database = Main.DatabaseManager;
                 
                 if (command.User.Id != Main.Variables.BotOwnerId && (command.User as SocketGuildUser)?.GuildPermissions.Administrator == false)
                 {
-                    responseEmbed.WithColor(Color.Red);
-                    responseEmbed.WithTitle("Not Authorized");
-                    responseEmbed.WithDescription("You do not have permission to use this command.");
-                    await command.RespondAsync(embed: responseEmbed.Build(), ephemeral: true);
+                    embed
+                        .WithColor(Color.Red)
+                        .WithTitle("Not Authorized")
+                        .WithDescription("You do not have permission to use this command.");
+                    
+                    await command.RespondAsync(embed: embed.Build(), ephemeral: true);
                     break;
                 }
                 
                 if (command.GuildId is null)
                 {
-                    responseEmbed.WithColor(Color.Red);
-                    responseEmbed.WithTitle("Not on guild context");
-                    responseEmbed.WithDescription("Failed to execute command on non-guild context.");
-                    await command.RespondAsync(embed: responseEmbed.Build(), ephemeral: true);
+                    embed.WithColor(Color.Red);
+                    embed.WithTitle("Not on guild context");
+                    embed.WithDescription("Failed to execute command on non-guild context.");
+                    await command.RespondAsync(embed: embed.Build(), ephemeral: true);
                     break;
                 }
 
                 var settings = await database.LoadSettingsAsync() ?? new SettingsModel();
                 settings.SupporterRolesForGuilds[command.GuildId.Value] = (command.Data.Options.FirstOrDefault(f => f.Name == "role")!.Value as SocketRole)!.Id;
                 await database.SaveSettingsAsync(settings);
-                responseEmbed.WithColor(Color.Green);
-                responseEmbed.WithTitle("Success");
-                responseEmbed.WithDescription("Supporter role updated successfully.");
-                await command.RespondAsync(embed: responseEmbed.Build(), ephemeral: true);
+                embed.WithColor(Color.Green);
+                embed.WithTitle("Success");
+                embed.WithDescription("Supporter role updated successfully.");
+                await command.RespondAsync(embed: embed.Build(), ephemeral: true);
                 Log.SuccessLine($"Guild '{command.GuildId.Value}' updated Supporter role id to '{settings.SupporterRolesForGuilds[command.GuildId.Value]}'.");
+                break;
+            }
+            case "check-supporter":
+            {
+                var embed = new EmbedBuilder();
+                var database = Main.DatabaseManager;
+                var registry = Main.LinkingRegistry;
+                
+                if (await database.GetUserLinkByDiscordUserIdAsync(command.User.Id) is not {} link)
+                {
+                    embed
+                        .WithColor(Color.Red)
+                        .WithTitle("Not linked yet")
+                        .WithDescription("This account was not linked to a game id, to link it please use /link.");
+                    
+                    await command.RespondAsync(embed: embed.Build(), ephemeral: true);
+                    break;
+                }
+
+                if (registry.IsSynchronizedSupporter(command.User.Id))
+                {
+                    embed
+                        .WithColor(Color.Orange)
+                        .WithTitle("Already synchronized")
+                        .WithDescription("You are already synchronized as a supporter");
+                    
+                    await command.RespondAsync(embed: embed.Build(), ephemeral: true);
+                    break;
+                }
+                
+                if (await registry.CreateSupporterAsync(command.User.Id) is not {} supporter)
+                {
+                    embed
+                        .WithColor(Color.Red)
+                        .WithTitle("Not a supporter")
+                        .WithDescription("Your game account doesn't have in-game supporter, please buy it first then re-check.");
+                    
+                    await command.RespondAsync(embed: embed.Build(), ephemeral: true);
+                    break;
+                }
+                
+                embed
+                    .WithColor(Color.Green)
+                    .WithTitle("Success")
+                    .WithDescription($"You received the supporter role, {
+                        (supporter.IsMod ? "it will never expire." : $"please keep in mind it will expire in {supporter.ExpirationDate:dd/MM/yyyy HH:mm:ss}")
+                    }");
+
+                await command.RespondAsync(embed: embed.Build(), ephemeral: true);
                 break;
             }
         }
@@ -140,6 +193,11 @@ public class DiscordManager : IDisposable, IAsyncDisposable
         setSupporterRoleCommandBuilder.WithDescription("Sets the supporter role for this discord server.");
         setSupporterRoleCommandBuilder.AddOption("role", ApplicationCommandOptionType.Role, "The role to set as the supporter role.", true);
         await Client.CreateGlobalApplicationCommandAsync(setSupporterRoleCommandBuilder.Build());
+        
+        var checkSupporterCommandBuilder = new SlashCommandBuilder();
+        checkSupporterCommandBuilder.WithName("check-supporter");
+        checkSupporterCommandBuilder.WithDescription("Checks the supporter from your in-game account.");
+        await Client.CreateGlobalApplicationCommandAsync(checkSupporterCommandBuilder.Build());
         
         OnReadyCompletion.SetResult();
     }
@@ -169,7 +227,11 @@ public class DiscordManager : IDisposable, IAsyncDisposable
     public static async Task<DiscordManager> CreateAsync(AstroLink main, string token)
     {
         Log.TraceLine($"Creating discord manager...");
-        var client = new DiscordSocketClient();
+        var client = new DiscordSocketClient(new DiscordSocketConfig()
+        {
+            AlwaysDownloadUsers = true,
+            GatewayIntents = GatewayIntents.All
+        });
         var manager = new DiscordManager(main, client);
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
