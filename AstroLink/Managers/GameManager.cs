@@ -477,9 +477,13 @@ public class GameManager(string gameId, string email, string password) : IDispos
         GameRoom = null;
         GameRoomId = null;
     }
-    
+
+    private bool _serviceReconnecting = false;
     private async Task OnServiceDisconnectAsync(object sender, string reason)
     {
+        if (_serviceReconnecting)
+            return;
+        _serviceReconnecting = true;
         Log.ErrorLine($"Disconnected from the service room!");
         var tries = 0;
         DisposeGameRoom();
@@ -508,10 +512,15 @@ public class GameManager(string gameId, string email, string password) : IDispos
                 await Task.Delay(NormalReconnectionCooldown);
             }
         }
+        _serviceReconnecting = false;
     }
     
+    private bool _gameReconnecting = false;
     private async Task OnGameDisconnectAsync(object sender, string reason)
     {
+        if (_gameReconnecting)
+            return;
+        _gameReconnecting = true;
         Log.ErrorLine($"Disconnected from the game room!");
         var tries = 0;
         DisposeGameRoom();
@@ -539,6 +548,8 @@ public class GameManager(string gameId, string email, string password) : IDispos
                 await Task.Delay(NormalReconnectionCooldown);
             }
         }
+
+        _gameReconnecting = false;
     }
 
     public async Task<double> GetServerTimeAsync()
