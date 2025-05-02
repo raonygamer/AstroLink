@@ -1,6 +1,9 @@
 ﻿using Astro.Managers;
 using Astro.Models;
+using Astro.Models.Database;
 using Astro.Utils;
+using Discord;
+using Discord.WebSocket;
 using Newtonsoft.Json;
 
 namespace Astro.Core;
@@ -16,11 +19,11 @@ public class AstroLink
         var result = -1;
         try
         {
-            AppDomain.CurrentDomain.ProcessExit += async void (_, __) =>
+            AppDomain.CurrentDomain.ProcessExit += void (_, __) =>
             {
                 try
                 {
-                    await Instance.ExitAsync();
+                    Instance.ExitAsync().GetAwaiter().GetResult();
                 }
                 catch
                 {
@@ -61,6 +64,7 @@ public class AstroLink
     public DatabaseManager DatabaseManager { get; private set; } = null!;
     public GameManager GameManager { get; private set; } = null!;
     public UptimeManager UptimeManager { get; private set; } = null!;
+    public DiscordManager DiscordManager { get; private set; } = null!;
 
     private async Task<int> StartAsync()
     {
@@ -76,29 +80,47 @@ public class AstroLink
 
         DatabaseManager = new DatabaseManager(Variables.DatabaseString);
         GameManager = new GameManager(Variables.GameId, Variables.GameEmail, Variables.GamePassword);
+        
         UptimeManager = new UptimeManager();
-        Updater.Tick += UptimeManager.TickAsync;
-        UptimeManager.OnServerOnline += async t => Log.SuccessLine($"Server is online: {new DateTime().Add(TimeSpan.FromMilliseconds(t)):HH:mm:ss dd:MM:yyyy}");
-        UptimeManager.OnServerOffline += async () => Log.SuccessLine("Server is offline!");
-        while (true)
+        
+        Task OnServerOnline(double time)
         {
-            try
-            {
-                if (!GameManager.IsConnected)
-                    await GameManager.ConnectAsync();
-                if (!GameManager.IsOnServiceRoom)
-                    await GameManager.ConnectToServiceRoomAsync();
-                if (!GameManager.IsOnGameRoom)
-                    await GameManager.ConnectToGameRoomAsync();
-                break;
-            }
-            catch (Exception ex)
-            {
-                Log.ErrorLine($"Failed to connect to game!");
-            }
-            await Task.Delay(5000);
+            Log.SuccessLine($"Server is online: {new DateTime().Add(TimeSpan.FromMilliseconds(time)):HH:mm:ss dd/MM/yyyy}");
+            return Task.CompletedTask;
+        }
+
+        Task OnServerOffline()
+        {
+            Log.WarnLine($"Server is offline!");
+            return Task.CompletedTask;
         }
         
+        UptimeManager.OnServerOnline += OnServerOnline;
+        UptimeManager.OnServerOffline += OnServerOffline;
+        
+        DiscordManager = new DiscordManager();
+        await DiscordManager.ConnectAsync(TokenType.Bot, Variables.DiscordToken);
+        
+        Updater.Tick += UptimeManager.TickAsync;
+        var settings = await DatabaseManager.LoadSettingsAsync() ?? new SettingsModel();
+        
+        foreach (var (guildId, channelId) in settings.UptimeChannelsForGuilds)
+        {
+            if (DiscordManager.Client.GetGuild(guildId)?.GetChannel(channelId) is SocketTextChannel textChannel)
+            {
+                await UptimeManager.FirstUptimeMessageAsync(textChannel);
+            }
+        }
+
+        void EachAttempt()
+        {
+            UptimeManager.ShouldForceNextCheck();
+        }
+        
+        await GameManager.TryConnectAsync(-1, EachAttempt);
+        await GameManager.TryConnectToServiceRoomAsync(-1, EachAttempt);
+        await GameManager.TryConnectToGameRoomAsync(-1, EachAttempt);
+        UptimeManager.ShouldForceNextCheck();
         await Task.Delay(-1);
         return 0;
     }
@@ -107,5 +129,17 @@ public class AstroLink
     {
         DatabaseManager.Dispose();
         GameManager.Dispose();
+        if (UptimeManager.UptimeMessage is not null)
+        {
+            await UptimeManager.UptimeMessage.ModifyAsync(p =>
+            {
+                p.Embed = new EmbedBuilder()
+                    .WithColor(Color.Default)
+                    .WithTitle("Offline")
+                    .WithDescription("The bot is offline!")
+                    .Build();
+            });
+        }
+        await DiscordManager.DisposeAsync();
     }
 }

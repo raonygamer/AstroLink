@@ -9,5 +9,5 @@ public class SettingsModel
     public ObjectId Id { get; set; } = ObjectId.GenerateNewId();
     
     [BsonSerializer(typeof(UlongKeyDictionarySerializer))]
-    public Dictionary<ulong, ulong> SupporterRolesForGuilds { get; set; } = [];
+    public Dictionary<ulong, ulong> UptimeChannelsForGuilds { get; set; } = [];
 }
