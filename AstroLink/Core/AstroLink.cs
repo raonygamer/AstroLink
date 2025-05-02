@@ -1,6 +1,5 @@
 ﻿using Astro.Managers;
 using Astro.Models;
-using Astro.Registries;
 using Astro.Utils;
 using Newtonsoft.Json;
 
@@ -59,16 +58,15 @@ public class AstroLink
     }
 
     public Updater? Updater { get; private set; }
-    public LinkingRegistry LinkingRegistry { get; private set; } = null!;
     public DatabaseManager DatabaseManager { get; private set; } = null!;
-    public DiscordManager DiscordManager { get; private set; } = null!;
     public GameManager GameManager { get; private set; } = null!;
+    public UptimeManager UptimeManager { get; private set; } = null!;
 
     private async Task<int> StartAsync()
     {
         if (await GetVariables() is not {} variables)
         {
-            Log.ErrorLine($"Variables are not valid: \n{JsonConvert.SerializeObject(Variables, Formatting.Indented)}");
+            Log.ErrorLine($"Variables are not valid:\n    {JsonConvert.SerializeObject(Variables, Formatting.Indented)}");
             return 1;
         }
         Variables = variables;
@@ -76,17 +74,30 @@ public class AstroLink
         Updater = new Updater(100);
         Updater.Start();
 
-        Log.TraceLine("Creating linking request registry...");
-        
-        DatabaseManager = await DatabaseManager.CreateAsync(this, Variables.DatabaseString);
-        DiscordManager = await DiscordManager.CreateAsync(this, Variables.DiscordToken);
-        GameManager = await GameManager.CreateAsync(this, Variables.GameId, Variables.GameEmail, Variables.GamePassword);
-        LinkingRegistry = new LinkingRegistry(this, DatabaseManager, GameManager, DiscordManager);
-        Updater.Tick += async () =>
+        DatabaseManager = new DatabaseManager(Variables.DatabaseString);
+        GameManager = new GameManager(Variables.GameId, Variables.GameEmail, Variables.GamePassword);
+        UptimeManager = new UptimeManager();
+        Updater.Tick += UptimeManager.TickAsync;
+        UptimeManager.OnServerOnline += async t => Log.SuccessLine($"Server is online: {new DateTime().Add(TimeSpan.FromMilliseconds(t)):HH:mm:ss dd:MM:yyyy}");
+        UptimeManager.OnServerOffline += async () => Log.SuccessLine("Server is offline!");
+        while (true)
         {
-            LinkingRegistry.CheckLinkingRequests();
-            await Task.CompletedTask;
-        };
+            try
+            {
+                if (!GameManager.IsConnected)
+                    await GameManager.ConnectAsync();
+                if (!GameManager.IsOnServiceRoom)
+                    await GameManager.ConnectToServiceRoomAsync();
+                if (!GameManager.IsOnGameRoom)
+                    await GameManager.ConnectToGameRoomAsync();
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log.ErrorLine($"Failed to connect to game!");
+            }
+            await Task.Delay(5000);
+        }
         
         await Task.Delay(-1);
         return 0;
@@ -95,7 +106,6 @@ public class AstroLink
     public async Task ExitAsync()
     {
         DatabaseManager.Dispose();
-        await DiscordManager.DisposeAsync();
         GameManager.Dispose();
     }
 }

@@ -1,250 +1,384 @@
 ﻿using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Timers;
 using Astro.Core;
 using Astro.Models.Database;
+using Astro.Models.Game;
 using Astro.Utils;
+using MongoDB.Driver.Linq;
 using PlayerIOClient;
 
 namespace Astro.Managers;
 
-public class GameManager : IDisposable
+#pragma warning disable CS0612 // Type or member is obsolete
+
+public class GameManager(string gameId, string email, string password) : IDisposable
 {
     public const int ClientVersion = 1389;
+    public const string HyperionSolarSystemKey = "HrAjOBivt0SHPYtxKyiB_Q";
     
-    public readonly AstroLink Main;
-    public readonly Client Client;
-    public Connection? ServiceConnection { get; private set; }
-
-    private readonly Dictionary<string, DatabaseObject> CachedPlayerObjects = [];
+    public AstroLink Main => AstroLink.Instance;
     
-    private GameManager(AstroLink main, Client client)
-    {
-        Main = main;
-        Client = client;
-    }
+    public Client? Client { get; private set; }
+    public Connection? ServiceRoom { get; private set; }
+    public string? ServiceRoomId { get; private set; }
+    public Connection? GameRoom { get; private set; }
+    public PlayerDataModel? PlayerData { get; private set; }
 
-    public static async Task<GameManager> CreateAsync(AstroLink main, string gameId, string email, string password)
+    public string GameId = gameId;
+    public string Email = email;
+    public string Password = password;
+    
+    public bool IsConnected => Client is not null;
+    public bool IsOnServiceRoom => IsConnected && ServiceRoom is not null && ServiceRoomId is not null && PlayerData is not null;
+    public bool IsOnGameRoom => IsOnServiceRoom && GameRoom is not null;
+    
+    public readonly string Session = Guid.NewGuid().ToString();
+
+    public TaskCompletionSource<PlayerDataModel?> OnPlayerJoinedServiceTask { get; private set; } = null!;
+
+    public async Task<Client> ConnectAsync()
     {
-        Log.TraceLine("Creating game manager...");
+        Log.TraceLine("Connecting to game...");
         var clientConnectionTask = new TaskCompletionSource<Client>();
-#pragma warning disable CS0612 // Type or member is obsolete
-        PlayerIO.QuickConnect.SimpleConnect(gameId, email, password, null, client =>
+
+        PlayerIO.QuickConnect.SimpleConnect(GameId, Email, Password, null, client =>
         {
             clientConnectionTask.TrySetResult(client);
         }, err =>
         {
             clientConnectionTask.TrySetException(err);
         });
-#pragma warning restore CS0612 // Type or member is obsolete
-        var client = await clientConnectionTask.Task;
-        var manager = new GameManager(main, client);
-        Log.SuccessLine($"Connected to game '{gameId}' with email '{email}'.");
-        Log.SuccessLine("Created game manager successfully.");
-        manager.ServiceConnection = await manager.ListAndConnectToServiceRoomAsync();
-        return manager;
+        
+        Log.SuccessLine($"Connected to game '{GameId}'.");
+        return Client = await clientConnectionTask.Task;
     }
 
-    public async Task<Connection> ListAndConnectToServiceRoomAsync()
+    public async Task ConnectToServiceRoomAsync()
     {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't connect to service room because Client was not connected.");
+        
         Log.TraceLine("Listing service rooms...");
         var listedRooms = await ListServiceRoomsAsync();
         
         Log.TraceLine("Joining service room...");
         if (listedRooms.Length == 0)
         {
-            return await ConnectToServiceRoomAsync(GetServiceRoomId());
+            await ConnectToServiceRoomAsync(GetServiceRoomId());
+            return;
         }
 
         var room = listedRooms.FirstOrDefault(r => r.OnlineUsers < 40);
         var lastId = listedRooms.Max(r => int.Parse(r.Id.Split('_').Last()));
-        if (room == null)
+        if (room is null)
         {
-            return await ConnectToServiceRoomAsync(GetServiceRoomId(lastId + 1));
+            await ConnectToServiceRoomAsync(GetServiceRoomId(lastId + 1));
+            return;
         }
-        return await ConnectToServiceRoomAsync(room.Id);
+        await ConnectToServiceRoomAsync(room.Id);
     }
 
     public async Task<RoomInfo[]> ListServiceRoomsAsync()
     {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't list service rooms because Client was not connected.");
+        
         var taskCompletionSource = new TaskCompletionSource<RoomInfo[]>();
-        Client.Multiplayer.ListRooms("service", null, 1000, 0, 
-            rooms => 
-            {
-                taskCompletionSource.SetResult(rooms.Where(r => 
-                    int.TryParse(r.Id.AsSpan(8, 4), NumberStyles.Integer, CultureInfo.InvariantCulture, out var version) && version >= ClientVersion).ToArray());
-            }, 
-            err =>
-            {
-                taskCompletionSource.SetException(err);
-            });
+        Client.Multiplayer.ListRooms("service", null, 1000, 0, rooms => 
+        {
+            taskCompletionSource.SetResult(rooms.Where(r => 
+                int.TryParse(r.Id.AsSpan(8, 4), NumberStyles.Integer, CultureInfo.InvariantCulture, out var version) && version >= ClientVersion).ToArray());
+        }, err =>
+        {
+            taskCompletionSource.SetException(err);
+        });
         
         return await taskCompletionSource.Task;
     }
     
-    private async Task<Connection> ConnectToServiceRoomAsync(string id)
+    private async Task ConnectToServiceRoomAsync(string id)
     {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't connect to service room because Client was null!");
+        
         var taskCompletionSource = new TaskCompletionSource<Connection>();
-        Client.Multiplayer.CreateJoinRoom(id, "service", true, [], new() { { "client_version", ClientVersion.ToString() } },
-            connection =>
+        OnPlayerJoinedServiceTask = new TaskCompletionSource<PlayerDataModel?>();
+        Client.Multiplayer.CreateJoinRoom(id, "service", true, [], new() { { "client_version", ClientVersion.ToString() } }, connection =>
+        {
+            Log.TraceLine(connection is { Connected: true }
+                ? $"Connected to service room '{id}'."
+                : $"Failed to connect to service room '{id}'.");
+            
+            connection.AddOnDisconnect(async void (s, msg) =>
+            {
+                try
+                {
+                    await OnServiceDisconnectAsync(s, msg);
+                }
+                catch (Exception ex)
+                {
+                    Log.ErrorLine($"Exception on service disconnect: \n{ex}");
+                }
+            });
+            
+            connection.AddOnMessage(async void (s, msg) =>
+            {
+                try
+                {
+                    await OnServiceMessageAsync(s, msg);
+                }
+                catch (Exception ex)
+                {
+                    Log.ErrorLine($"Exception on service message: \n{ex}");
+                }
+            });
+            
+            taskCompletionSource.TrySetResult(connection);
+            ServiceRoomId = id;
+        }, err =>
+        {
+            taskCompletionSource.TrySetException(err);
+            OnPlayerJoinedServiceTask.TrySetResult(null);
+        });
+        
+        ServiceRoom = await taskCompletionSource.Task;
+        PlayerData = await OnPlayerJoinedServiceTask.Task;
+    }
+
+    public async Task ConnectToGameRoomAsync()
+    {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't connect to game room because Client was not connected.");
+        
+        if (!IsOnServiceRoom)
+            throw new Exception("Couldn't connect to game room because the client is not on a service room.");
+        
+        
+        var rooms = (await ListGameRoomsAsync()).Where(r => r.Id == GetClanGameRoomId(HyperionSolarSystemKey, PlayerData!.ClanId!));
+        GameRoom = await JoinGameRoomAsync();
+    }
+
+    private async Task<Connection> JoinGameRoomAsync()
+    {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't connect to game room because Client was not connected.");
+        
+        if (!IsOnServiceRoom)
+            throw new Exception("Couldn't connect to game room because the client is not on a service room.");
+        
+        var taskCompletionSource = new TaskCompletionSource<Connection>();
+        var id = GetClanGameRoomId(HyperionSolarSystemKey, PlayerData!.ClanId!);
+        Client.Multiplayer.CreateJoinRoom(
+            id,
+            "game",
+            false,
+            new()
+            {
+                { "solarSystemKey", HyperionSolarSystemKey },
+                { "service", ServiceRoomId },
+                { "pvpAboveCap", "false" },
+                { "systemType", "clan" }
+            },
+            new()
+            {
+                { "client_version", ClientVersion.ToString() },
+                { "session", Session },
+                { "warpJump", "false" },
+                { "level", PlayerData.Level > 0 ? PlayerData.Level.ToString() : "1" }
+            }, connection =>
             {
                 Log.TraceLine(connection is { Connected: true }
-                    ? $"Connected to service room '{id}'."
-                    : $"Failed to connect to service room '{id}'.");
+                    ? $"Connected to game room '{id}'."
+                    : $"Failed to connect to game room '{id}'.");
+            
                 connection.AddOnDisconnect(async void (s, msg) =>
                 {
                     try
                     {
-                        await OnServiceDisconnectAsync(s, msg);
+                        await OnGameDisconnectAsync(s, msg);
                     }
                     catch (Exception ex)
                     {
-                        Log.ErrorLine($"Exception on service disconnect: \n{ex}");
+                        Log.ErrorLine($"Exception on game disconnect: \n{ex}");
                     }
                 });
-                
+            
                 connection.AddOnMessage(async void (s, msg) =>
                 {
                     try
                     {
-                        await OnServiceMessageAsync(s, msg);
+                        await OnGameMessageAsync(s, msg);
                     }
                     catch (Exception ex)
                     {
-                        Log.ErrorLine($"Exception on service message: \n{ex}");
+                        Log.ErrorLine($"Exception on game message: \n{ex}");
                     }
                 });
                 
-                taskCompletionSource.SetResult(connection);
-            }, 
-            err =>
+                taskCompletionSource.TrySetResult(connection);
+            }, err =>
             {
-                taskCompletionSource.SetException(err);
+                taskCompletionSource.TrySetException(err);
             });
+        return await taskCompletionSource.Task;
+    }
+
+    public async Task<RoomInfo[]> ListGameRoomsAsync()
+    {
+        if (Client is null)
+            throw new NullReferenceException("Couldn't list game rooms because Client was not connected.");
+
+        if (!IsOnServiceRoom)
+            throw new Exception("Couldn't list game rooms because the client is not on a service room.");
         
-        var connection = await taskCompletionSource.Task;
-        return connection;
+        var taskCompletionSource = new TaskCompletionSource<RoomInfo[]>();
+        Client.Multiplayer.ListRooms("game", new()
+        {
+            { "solarSystemKey", HyperionSolarSystemKey },
+            { "service", ServiceRoomId }
+        }, 1000, 0, rooms =>
+        {
+            const int maxUsers = 15;
+            taskCompletionSource.TrySetResult(rooms.Where(room =>
+            {
+                if (!int.TryParse(room.RoomData["version"], out var version) || version < ClientVersion)
+                    return false;
+                if (room.OnlineUsers >= maxUsers)
+                    return false;
+                if (room.RoomData.TryGetValue("modLocked", out var modLocked) && modLocked == "true")
+                    return false;
+                if (room.RoomData.TryGetValue("modClosed", out var modClosed) && modClosed == "true")
+                    return false;
+                return true;
+            }).ToArray());
+        }, err =>
+        {
+            taskCompletionSource.TrySetException(err);
+        });
+        
+        return await taskCompletionSource.Task;
     }
 
     public static string GetServiceRoomId(int index = 0)
     {
         return $"Service-{ClientVersion}_{index}";
     }
+
+    public static string GetClanGameRoomId(string solarSystemId, string clanId)
+    {
+        return BitConverter.ToString(MD5.HashData(Encoding.UTF8.GetBytes(solarSystemId + clanId))).Replace("-", string.Empty).ToLowerInvariant();
+    }
     
     private async Task OnServiceMessageAsync(object sender, Message message)
     {
         switch (message.Type)
         {
-            case "chatMsg":
-                var messageType = message.GetString(0);
-                var messageContent = message.GetString(1);
-                var senderId = message.GetString(2);
-                var senderName = message.GetString(3);
-                var roles = message.GetString(4);
-                var supporter = message.GetBoolean(5);
-                await OnReceiveChatMessage(messageType, messageContent, senderId, senderName, roles, supporter);
+            case "joined":
+                await OnPlayerJoinedServiceRoomAsync(new PlayerDataModel()
+                {
+                    Level = message.GetInt(1),
+                    ClanId = message.GetString(18)
+                });
+                break;
+            default:
+                break;
+        }
+    }
+    
+    private async Task OnGameMessageAsync(object sender, Message message)
+    {
+        switch (message.Type)
+        {
+            case "error":
+            case "softDisconnect":
+            case "disconnect":
+                await OnGameDisconnectAsync(sender, "Disconnected from the game!");
                 break;
             default:
                 break;
         }
     }
 
-    private async Task OnReceiveChatMessage(string messageType, string messageContent, string senderId, string senderName, string roles, bool supporter)
+    public async Task OnPlayerJoinedServiceRoomAsync(PlayerDataModel player)
     {
-        if (messageType != "private" || senderId == Client.ConnectUserId)
-            return;
-                
-        var database = Main.DatabaseManager;
-        var registry = Main.LinkingRegistry;
-        var discord = Main.DiscordManager;
-                
-        if (await registry.AcceptLinkingRequest(messageContent, senderId) is not {} linkingRequest)
-        {
-            SendPrivateMessage(senderName, $"<font color='#ff3849'>No linking request found with token </font>'{messageContent}'");
-            return;
-        }
-        
-        var discordUsername = discord.Client.GetUser(linkingRequest.DiscordUserId).Username;
-        SendPrivateMessage(senderName,
-            $"<font color='#38ff5d'>Linked your game account to discord </font>'{discordUsername}'");
-    }
-    
-    public void SendPrivateMessage(string name, string content)
-    {
-        ServiceConnection?.Send("chatMsg", "private", name, content);
-    }
-
-    public async Task<IEnumerable<DatabaseObject>> GetPlayerObjectsAsync(string[] playerIds)
-    {
-        var isCached = playerIds.All(playerId => CachedPlayerObjects.ContainsKey(playerId));
-        if (isCached)
-        {
-            return CachedPlayerObjects.Where(kv => playerIds.Contains(kv.Key)).Select(kv => kv.Value);
-        }
-
-        var taskCompletionSource = new TaskCompletionSource<DatabaseObject[]>();
-        Client.BigDB.LoadKeys("PlayerObjects", playerIds, 
-            playerObjects => taskCompletionSource.SetResult(playerObjects), 
-            error => taskCompletionSource.SetException(error));
-        var playerObjects = await taskCompletionSource.Task;
-        foreach (var pObj in playerObjects)
-        {
-            CachedPlayerObjects[pObj.Key] = pObj;
-        }
-        return playerObjects;
-    }
-    
-    public IEnumerable<DatabaseObject> GetPlayerObjects(string[] playerIds)
-    {
-        var isCached = playerIds.All(playerId => CachedPlayerObjects.ContainsKey(playerId));
-        if (isCached)
-        {
-            return CachedPlayerObjects.Where(kv => playerIds.Contains(kv.Key)).Select(kv => kv.Value);
-        }
-
-        var taskCompletionSource = new TaskCompletionSource<DatabaseObject[]>();
-        Client.BigDB.LoadKeys("PlayerObjects", playerIds, 
-            playerObjects => taskCompletionSource.SetResult(playerObjects), 
-            error => taskCompletionSource.SetException(error));
-        var playerObjects = taskCompletionSource.Task.Result;
-        foreach (var pObj in playerObjects)
-        {
-            CachedPlayerObjects[pObj.Key] = pObj;
-        }
-        return playerObjects;
-    }
-
-    public async Task<DatabaseObject> GetPlayerObjectAsync(string playerId)
-    {
-        if (CachedPlayerObjects.TryGetValue(playerId, out var playerObject))
-            return playerObject;
-        
-        var taskCompletionSource = new TaskCompletionSource<DatabaseObject>();
-        Client.BigDB.Load("PlayerObjects", playerId, 
-            pObject => taskCompletionSource.SetResult(pObject), 
-            error => taskCompletionSource.SetException(error));
-        playerObject = await taskCompletionSource.Task;
-        return playerObject;
+        OnPlayerJoinedServiceTask.TrySetResult(player);
     }
     
     private async Task OnServiceDisconnectAsync(object sender, string reason)
     {
-        Log.ErrorLine($"Disconnected from the service room: \n    {reason}.");
+        Log.ErrorLine($"Disconnected from the service room!");
         await Task.Delay(TimeSpan.FromSeconds(5));
-        ServiceConnection?.Disconnect();
-        ServiceConnection = null;
+        GameRoom?.Disconnect();
+        GameRoom = null;
+        ServiceRoom?.Disconnect();
+        ServiceRoom = null;
+        ServiceRoomId = null;
+        PlayerData = null;
         try
         {
-            await ListAndConnectToServiceRoomAsync();
+            await ConnectToServiceRoomAsync();
         }
         catch (Exception ex)
         {
-            Log.ErrorLine($"Failed to reconnect to the service room: \n    {ex.Message}.");
+            Log.ErrorLine($"Failed to reconnect to the service room!");
+        }
+    }
+    
+    private async Task OnGameDisconnectAsync(object sender, string reason)
+    {
+        Log.ErrorLine($"Disconnected from the game room!");
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        GameRoom?.Disconnect();
+        GameRoom = null;
+        try
+        {
+            await ConnectToGameRoomAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.ErrorLine($"Failed to reconnect to the game room!");
+        }
+    }
+
+    public async Task<double?> GetServerTimeAsync()
+    {
+        if (!IsOnServiceRoom)
+            return null;
+
+        var taskCompletionSource = new TaskCompletionSource<double>();
+        void RpcTime(object sender, Message m)
+        {
+            if (m.Type != "serverTime")
+                return;
+            taskCompletionSource.TrySetResult(m.GetDouble(0));
+            if (GameRoom is not null)
+                GameRoom.OnMessage -= RpcTime;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(10000);
+            taskCompletionSource.TrySetCanceled();
+        });
+        
+        GameRoom!.OnMessage += RpcTime;
+        GameRoom!.Send("timeRequest", Client!.ConnectUserId);
+        try
+        {
+            return await taskCompletionSource.Task;
+        }
+        catch (TaskCanceledException)
+        {
+            return null;
         }
     }
 
     public void Dispose()
     {
         GC.SuppressFinalize(this);
-        ServiceConnection?.Disconnect();
-        Client.Logout();
+        ServiceRoom?.Disconnect();
+        Client?.Logout();
     }
 }

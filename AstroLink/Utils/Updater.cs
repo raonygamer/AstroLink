@@ -1,25 +1,22 @@
 ﻿namespace Astro.Utils;
 
-public class Updater
+public class Updater(double tickInterval)
 {
-    public readonly uint TickInterval;
-    public event Func<Task>? Tick;
+    public readonly double TickInterval = tickInterval;
+    public double Time { get; private set; } = 0;
+    public event Func<Updater, Task>? Tick;
     public bool Running { get; private set; }
-    
-    public Updater(uint tickInterval)
-    {
-        TickInterval = tickInterval;
-    }
 
     public void Loop()
     {
-        Task.Run(async void () =>
+        _ = Task.Run(async () =>
         {
             while (Running)
             {
+                Time += TickInterval;
                 try
                 {
-                    await (Tick?.Invoke() ?? Task.CompletedTask);
+                    await (Tick?.Invoke(this) ?? Task.CompletedTask);
                 }
                 catch
                 {
