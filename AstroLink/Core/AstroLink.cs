@@ -81,46 +81,46 @@ public class AstroLink
         DatabaseManager = new DatabaseManager(Variables.DatabaseString);
         GameManager = new GameManager(Variables.GameId, Variables.GameEmail, Variables.GamePassword);
         
-        UptimeManager = new UptimeManager();
+        // UptimeManager = new UptimeManager();
+        //
+        // Task OnServerOnline(double time)
+        // {
+        //     Log.SuccessLine($"Server is online: {new DateTime().Add(TimeSpan.FromMilliseconds(time)):HH:mm:ss dd/MM/yyyy}");
+        //     return Task.CompletedTask;
+        // }
+        //
+        // Task OnServerOffline()
+        // {
+        //     Log.WarnLine($"Server is offline!");
+        //     return Task.CompletedTask;
+        // }
+        //
+        // UptimeManager.OnServerOnline += OnServerOnline;
+        // UptimeManager.OnServerOffline += OnServerOffline;
         
-        Task OnServerOnline(double time)
-        {
-            Log.SuccessLine($"Server is online: {new DateTime().Add(TimeSpan.FromMilliseconds(time)):HH:mm:ss dd/MM/yyyy}");
-            return Task.CompletedTask;
-        }
-
-        Task OnServerOffline()
-        {
-            Log.WarnLine($"Server is offline!");
-            return Task.CompletedTask;
-        }
+        //DiscordManager = new DiscordManager();
+        //await DiscordManager.ConnectAsync(TokenType.Bot, Variables.DiscordToken);
         
-        UptimeManager.OnServerOnline += OnServerOnline;
-        UptimeManager.OnServerOffline += OnServerOffline;
-        
-        DiscordManager = new DiscordManager();
-        await DiscordManager.ConnectAsync(TokenType.Bot, Variables.DiscordToken);
-        
-        Updater.Tick += UptimeManager.TickAsync;
+        //Updater.Tick += UptimeManager.TickAsync;
         var settings = await DatabaseManager.LoadSettingsAsync() ?? new SettingsModel();
         
-        foreach (var (guildId, channelId) in settings.UptimeChannelsForGuilds)
-        {
-            if (DiscordManager.Client.GetGuild(guildId)?.GetChannel(channelId) is SocketTextChannel textChannel)
-            {
-                await UptimeManager.FirstUptimeMessageAsync(textChannel);
-            }
-        }
+        // foreach (var (guildId, channelId) in settings.UptimeChannelsForGuilds)
+        // {
+        //     if (DiscordManager.Client.GetGuild(guildId)?.GetChannel(channelId) is SocketTextChannel textChannel)
+        //     {
+        //         await UptimeManager.FirstUptimeMessageAsync(textChannel);
+        //     }
+        // }
 
         void EachAttempt()
         {
             UptimeManager.ShouldForceNextCheck();
         }
         
-        await GameManager.TryConnectAsync(-1, EachAttempt);
-        await GameManager.TryConnectToServiceRoomAsync(-1, EachAttempt);
-        await GameManager.TryConnectToGameRoomAsync(-1, EachAttempt);
-        UptimeManager.ShouldForceNextCheck();
+        await GameManager.TryAuthenticateAsync();
+        await GameManager.JoinSuitableServiceRoomAsync();
+        //await GameManager.TryConnectToGameRoomAsync(-1, EachAttempt);
+        //UptimeManager.ShouldForceNextCheck();
         await Task.Delay(-1);
         return 0;
     }

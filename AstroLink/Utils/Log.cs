@@ -1,4 +1,7 @@
-﻿namespace Astro.Utils;
+﻿using System.Diagnostics;
+using System.Reflection;
+
+namespace Astro.Utils;
 
 public static class Log
 {

@@ -37,7 +37,7 @@ public class UptimeManager
             NextTickPing = updater.Time + TickPingCooldown;
             try
             {
-                var serverTime = await Game.GetServerTimeAsync();
+                var serverTime = 0;
                 IsOnline = serverTime != 0;
                 if (ForceNextCheck)
                 {

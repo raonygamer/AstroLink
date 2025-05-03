@@ -1,4 +1,5 @@
 ﻿using System.Globalization;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using System.Timers;
@@ -6,6 +7,7 @@ using Astro.Core;
 using Astro.Models.Database;
 using Astro.Models.Game;
 using Astro.Utils;
+using Microsoft.Extensions.Logging;
 using MongoDB.Driver.Linq;
 using PlayerIOClient;
 
@@ -15,42 +17,36 @@ namespace Astro.Managers;
 
 public class GameManager(string gameId, string email, string password) : IDisposable
 {
-    public const int ClientVersion = 1389;
-    public const string HyperionSolarSystemKey = "HrAjOBivt0SHPYtxKyiB_Q";
-    public const int NormalReconnectionCooldown = 10 * 1000;
-    public const int BiggerReconnectionCooldown = 30 * 1000;
-    public const int MaxServiceReconnections = 5;
-    public const int MaxGameReconnections = 5;
-    
     public AstroLink Main => AstroLink.Instance;
     
-    public Client? Client { get; private set; }
-    public Connection? ServiceRoom { get; private set; }
-    public string? ServiceRoomId { get; private set; }
-    public Connection? GameRoom { get; private set; }
-    public string? GameRoomId { get; private set; }
-    public PlayerDataModel? PlayerData { get; private set; }
-
+    public const int ClientVersion = 1389;
+    public const string HyperionSolarSystemKey = "HrAjOBivt0SHPYtxKyiB_Q";
+    public const int ServerConnectionDelay = 10 * 1000;
+    public const int ServerConnectionCooldown = 30 * 1000;
+    public const int MaxServerAuthentications = 3;
+    public const int MaxServiceReconnections = 3;
+    public const int MaxGameReconnections = 3;
+    
+    #region Authentication
+    public readonly string Session = Guid.NewGuid().ToString();
     public readonly string GameId = gameId;
     public readonly string Email = email;
     public readonly string Password = password;
-    
-    public bool IsConnected => Client is not null;
-    public bool IsOnServiceRoom => IsConnected && ServiceRoom is not null && ServiceRoomId is not null && PlayerData is not null;
-    public bool IsOnGameRoom => IsOnServiceRoom && GameRoom is not null;
-    
-    public bool IsConnectingToServiceRoom { get; private set; } = false;
-    public bool IsConnectingToGameRoom { get; private set; } = false;
-    
-    public readonly string Session = Guid.NewGuid().ToString();
-
-    public TaskCompletionSource<PlayerDataModel?> OnPlayerJoinedServiceTask { get; private set; } = null!;
-
-    public async Task<Client> ConnectAsync()
+    public Client? Client { get; private set; }
+    public bool IsAuthenticated => Client is not null;
+    public AuthenticationException? CheckAuthenticated(string message = "Not authenticated with server.")
     {
-        Log.TraceLine("Connecting to game...");
+        if (!IsAuthenticated || Client is not { } client)
+        {
+            return new AuthenticationException(message);
+        }
+        return null;
+    }
+    public async Task<Client> AuthenticateAsync()
+    {
+        if (IsAuthenticated)
+            return Client!;
         var clientConnectionTask = new TaskCompletionSource<Client>();
-
         PlayerIO.QuickConnect.SimpleConnect(GameId, Email, Password, null, client =>
         {
             clientConnectionTask.TrySetResult(client);
@@ -58,540 +54,225 @@ public class GameManager(string gameId, string email, string password) : IDispos
         {
             clientConnectionTask.TrySetException(err);
         });
-        
-        Log.SuccessLine($"Connected to game '{GameId}'.");
         return Client = await clientConnectionTask.Task;
     }
 
-    public async Task<bool> TryConnectAsync(int maxTries = -1, Action? eachAttempt = null)
+    public async Task<Client?> TryAuthenticateAsync(int maxTries = -1)
     {
         var tries = 0;
-        while (true)
+        var triesForInterval = 0;
+        Client? client = null;
+        do
         {
-            if (maxTries != -1 && tries++ >= maxTries)
-                break;
-            try
-            {
-                if (!IsConnected)
-                    await ConnectAsync();
-                break;
-                eachAttempt?.Invoke();
-            }
-            catch (Exception ex)
-            {
-                var parts = ex.Message.Split('.');
-                Log.ErrorLine($"Failed to authenticate to the server: {parts.FirstOrDefault("You broke it.")}");
-            }
-            await Task.Delay(NormalReconnectionCooldown);
-        }
-        return IsConnected;
-    }
-
-    public async Task<bool> TryConnectToServiceRoomAsync(int maxTries = -1, Action? eachAttempt = null)
-    {
-        var tries = 0;
-        var internalTries = 0;
-        while (true)
-        {
-            if (maxTries != -1 && internalTries++ >= maxTries)
-                break;
             tries++;
+            triesForInterval++;
             try
             {
-                if (!IsOnServiceRoom)
-                    await ConnectToServiceRoomAsync();
+                Log.TraceLine("Trying to authenticate to the server...");
+                client = await AuthenticateAsync();
                 break;
-                eachAttempt?.Invoke();
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                var parts = ex.Message.Split('.');
-                Log.ErrorLine($"Failed to connect to the service room: {parts.FirstOrDefault("You broke it.")}");
+                Log.ErrorLine($"Failed to authenticate to the server: {e.Message}");
+                if (maxTries == -1 || tries < maxTries)
+                    Log.TraceLine($"Retrying in {Math.Floor((double)(triesForInterval >= MaxServerAuthentications ? ServerConnectionCooldown : ServerConnectionDelay) / 1000)}s...");
+                // Ignored
             }
 
-            if (tries >= MaxServiceReconnections)
+            if (triesForInterval >= MaxServerAuthentications)
             {
-                tries = 0;
-                await Task.Delay(BiggerReconnectionCooldown);
+                await Task.Delay(ServerConnectionCooldown);
+                triesForInterval = 0;
             }
             else
             {
-                await Task.Delay(NormalReconnectionCooldown);
+                await Task.Delay(ServerConnectionDelay);
             }
-        }
+        } while (maxTries == -1 || tries < maxTries);
 
-        return IsOnServiceRoom;
+        if (client is not null)
+        {
+            Log.SuccessLine($"Authenticated successfully to the server.");
+        }
+        return client;
     }
-    
-    public async Task<bool> TryConnectToGameRoomAsync(int maxTries = -1, Action? eachAttempt = null)
+    #endregion
+    #region Service Room
+    public async Task<IEnumerable<RoomInfo>> GetServiceRoomsAsync()
     {
-        var tries = 0;
-        var internalTries = 0;
-        while (true)
-        {
-            if (maxTries != -1 && internalTries++ >= maxTries)
-                break;
-            tries++;
-            try
+        if (CheckAuthenticated("Could not get service rooms because client was not authenticated.") is { } ex)
+            throw ex;
+        var client = Client!;
+        
+        var taskCompletionSource = new TaskCompletionSource<IEnumerable<RoomInfo>>();
+        client.Multiplayer.ListRooms(
+            "service",
+            [],
+            1000,
+            0,
+            rooms =>
             {
-                if (!IsOnGameRoom)
-                    await ConnectToGameRoomAsync();
-                break;
-                eachAttempt?.Invoke();
-            }
-            catch (Exception ex)
-            {
-                var parts = ex.Message.Split('.');
-                Log.ErrorLine($"Failed to connect to the game room: {parts.FirstOrDefault("You broke it.")}");
-            }
-
-            if (tries >= MaxGameReconnections)
-            {
-                tries = 0;
-                await Task.Delay(BiggerReconnectionCooldown);
-            }
-            else
-            {
-                await Task.Delay(NormalReconnectionCooldown);
-            }
-        }
-
-        return IsOnGameRoom;
-    }
-    
-    public async Task ConnectToServiceRoomAsync()
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't connect to service room because Client was not connected.");
-        
-        if (IsConnectingToServiceRoom)
-            throw new Exception("Already connecting to a service room.");
-        
-        Log.TraceLine("Listing service rooms...");
-        var listedRooms = await ListServiceRoomsAsync();
-        
-        Log.TraceLine("Joining service room...");
-        if (listedRooms.Length == 0)
-        {
-            await ConnectToServiceRoomAsync(GetServiceRoomId());
-            return;
-        }
-
-        var room = listedRooms.FirstOrDefault(r => r.OnlineUsers < 40);
-        var lastId = listedRooms.Max(r => int.Parse(r.Id.Split('_').Last()));
-        if (room is null)
-        {
-            await ConnectToServiceRoomAsync(GetServiceRoomId(lastId + 1));
-            return;
-        }
-        await ConnectToServiceRoomAsync(room.Id);
-    }
-
-    public async Task<RoomInfo[]> ListServiceRoomsAsync()
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't list service rooms because Client was not connected.");
-        
-        var taskCompletionSource = new TaskCompletionSource<RoomInfo[]>();
-        Client.Multiplayer.ListRooms("service", null, 1000, 0, rooms => 
-            {
-                taskCompletionSource.SetResult(rooms.Where(r => 
-                    int.TryParse(r.Id.AsSpan(8, 4), NumberStyles.Integer, CultureInfo.InvariantCulture, out var version) && version >= ClientVersion).ToArray());
-            }, err =>
-            {
-                taskCompletionSource.SetException(err);
-            });
-        
-        return await taskCompletionSource.Task;
-    }
-    
-    private async Task ConnectToServiceRoomAsync(string id)
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't connect to service room because Client was null!");
-        
-        if (IsConnectingToServiceRoom)
-            throw new Exception("Already connecting to a service room.");
-        IsConnectingToServiceRoom = true;
-
-        if (ServiceRoom is not null && ServiceRoom.Connected)
-        {
-            DisposeServiceRoom();
-        }
-        
-        var taskCompletionSource = new TaskCompletionSource<Connection>();
-        OnPlayerJoinedServiceTask = new TaskCompletionSource<PlayerDataModel?>();
-        Client.Multiplayer.CreateJoinRoom(id, "service", true, [], new() { { "client_version", ClientVersion.ToString() } }, connection =>
-            {
-                Log.TraceLine(connection is { Connected: true }
-                    ? $"Connected to service room '{id}'."
-                    : $"Failed to connect to service room '{id}'.");
-
-                connection.OnDisconnect += OnServiceDisconnect;
-                connection.OnMessage += OnServiceMessage;
-                taskCompletionSource.TrySetResult(connection);
-                ServiceRoomId = id;
-            }, err =>
-            {
-                taskCompletionSource.TrySetException(err);
-                OnPlayerJoinedServiceTask.TrySetResult(null);
-            });
-
-        try
-        {
-            ServiceRoom = await taskCompletionSource.Task;
-            PlayerData = await OnPlayerJoinedServiceTask.Task;
-        }
-        finally
-        {
-            IsConnectingToServiceRoom = false;
-        }
-    }
-
-    public async Task ConnectToGameRoomAsync()
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't connect to game room because Client was not connected.");
-        
-        if (!IsOnServiceRoom)
-            throw new Exception("Couldn't connect to game room because the client is not on a service room.");
-        
-        if (IsConnectingToGameRoom)
-            throw new Exception("Already connecting to a game room.");
-        
-        await JoinGameRoomAsync();
-    }
-
-    private async Task JoinGameRoomAsync()
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't connect to game room because Client was not connected.");
-        
-        if (!IsOnServiceRoom)
-            throw new Exception("Couldn't connect to game room because the client is not on a service room.");
-
-        if (IsConnectingToGameRoom)
-            throw new Exception("Already connecting to a game room.");
-        IsConnectingToGameRoom = true;
-
-        if (GameRoom is not null && GameRoom.Connected)
-        {
-            DisposeGameRoom();
-        }
-        
-        var taskCompletionSource = new TaskCompletionSource<Connection>();
-        var id = GetClanGameRoomId(HyperionSolarSystemKey, PlayerData!.ClanId!);
-        Client.Multiplayer.CreateJoinRoom(
-            id,
-            "game",
-            false,
-            new()
-            {
-                { "solarSystemKey", HyperionSolarSystemKey },
-                { "service", ServiceRoomId },
-                { "pvpAboveCap", "false" },
-                { "systemType", "clan" }
+                taskCompletionSource.TrySetResult(rooms);
             },
-            new()
+            error =>
             {
-                { "client_version", ClientVersion.ToString() },
-                { "session", Session },
-                { "warpJump", "false" },
-                { "level", PlayerData.Level > 0 ? PlayerData.Level.ToString() : "1" }
-            }, connection =>
-            {
-                Log.TraceLine(connection is { Connected: true }
-                    ? $"Connected to game room '{id}'."
-                    : $"Failed to connect to game room '{id}'.");
-            
-                connection.OnDisconnect += OnGameDisconnect;
-                connection.OnMessage += OnGameMessage;
-                taskCompletionSource.TrySetResult(connection);
-                GameRoomId = id;
-            }, err =>
-            {
-                taskCompletionSource.TrySetException(err);
-            });
-        
-        try
-        {
-            GameRoom = await taskCompletionSource.Task;
-        }
-        finally
-        {
-            IsConnectingToGameRoom = false;
-        }
-    }
-
-    public async Task<RoomInfo[]> ListGameRoomsAsync()
-    {
-        if (Client is null)
-            throw new NullReferenceException("Couldn't list game rooms because Client was not connected.");
-
-        if (!IsOnServiceRoom)
-            throw new Exception("Couldn't list game rooms because the client is not on a service room.");
-        
-        var taskCompletionSource = new TaskCompletionSource<RoomInfo[]>();
-        Client.Multiplayer.ListRooms("game", new()
-        {
-            { "solarSystemKey", HyperionSolarSystemKey },
-            { "service", ServiceRoomId }
-        }, 1000, 0, rooms =>
-        {
-            const int maxUsers = 15;
-            taskCompletionSource.TrySetResult(rooms.Where(room =>
-            {
-                if (!int.TryParse(room.RoomData["version"], out var version) || version < ClientVersion)
-                    return false;
-                if (room.OnlineUsers >= maxUsers)
-                    return false;
-                if (room.RoomData.TryGetValue("modLocked", out var modLocked) && modLocked == "true")
-                    return false;
-                if (room.RoomData.TryGetValue("modClosed", out var modClosed) && modClosed == "true")
-                    return false;
-                return true;
-            }).ToArray());
-        }, err =>
-        {
-            taskCompletionSource.TrySetException(err);
-        });
-        
+                taskCompletionSource.TrySetException(error);
+            }
+        );
         return await taskCompletionSource.Task;
     }
 
-    public static string GetServiceRoomId(int index = 0)
-    {
-        return $"Service-{ClientVersion}_{index}";
-    }
-
-    public static string GetClanGameRoomId(string solarSystemId, string clanId)
-    {
-        return BitConverter.ToString(MD5.HashData(Encoding.UTF8.GetBytes(solarSystemId + clanId))).Replace("-", string.Empty).ToLowerInvariant();
-    }
+    public string GetServiceRoomId(int index) => $"Service-{ClientVersion}_{index}";
     
-    private async Task OnServiceMessageAsync(object sender, Message message)
+    public async Task<Connection> JoinSuitableServiceRoomAsync()
     {
-        switch (message.Type)
-        {
-            case "joined":
-                await OnPlayerJoinedServiceRoomAsync(new PlayerDataModel()
-                {
-                    Level = message.GetInt(1),
-                    ClanId = message.GetString(18)
-                });
-                break;
-            default:
-                break;
-        }
-    }
-    
-    private async Task OnGameMessageAsync(object sender, Message message)
-    {
-        switch (message.Type)
-        {
-            case "error":
-            case "softDisconnect":
-            case "disconnect":
-                break;
-            default:
-                break;
-        }
-    }
-
-    private async Task OnPlayerJoinedServiceRoomAsync(PlayerDataModel player)
-    {
-        OnPlayerJoinedServiceTask.TrySetResult(player);
-    }
-
-    private void OnServiceDisconnect(object sender, string reason)
-    {
-        try
-        {
-            _ = OnServiceDisconnectAsync(sender, reason);
-        }
-        catch (Exception ex)
-        {
-            var parts = ex.Message.Split('.');
-            Log.ErrorLine($"Exception on service disconnect: {parts.FirstOrDefault("You broke it.")}");
-        }
-    }
-    
-    private void OnServiceMessage(object sender, Message message)
-    {
-        try
-        {
-            _ = OnServiceMessageAsync(sender, message);
-        }
-        catch (Exception ex)
-        {
-            var parts = ex.Message.Split('.');
-            Log.ErrorLine($"Exception on service message: {parts.FirstOrDefault("You broke it.")}");
-        }
-    }
-    
-    private void OnGameDisconnect(object sender, string reason)
-    {
-        try
-        {
-            _ = OnGameDisconnectAsync(sender, reason);
-        }
-        catch (Exception ex)
-        {
-            var parts = ex.Message.Split('.');
-            Log.ErrorLine($"Exception on game disconnect: {parts.FirstOrDefault("You broke it.")}");
-        }
-    }
-    
-    private void OnGameMessage(object sender, Message message)
-    {
-        try
-        {
-            _ = OnGameMessageAsync(sender, message);
-        }
-        catch (Exception ex)
-        {
-            var parts = ex.Message.Split('.');
-            Log.ErrorLine($"Exception on game message: {parts.FirstOrDefault("You broke it.")}");
-        }
-    }
-
-    private void DisposeServiceRoom()
-    {
-        if (ServiceRoom is not null)
-        {
-            ServiceRoom.OnMessage -= OnServiceMessage;
-            ServiceRoom.OnDisconnect -= OnServiceDisconnect;
-        }
-        ServiceRoom = null;
-        ServiceRoomId = null;
-        PlayerData = null;
-    }
-    
-    private void DisposeGameRoom()
-    {
-        if (GameRoom is not null)
-        {
-            GameRoom.OnMessage -= OnGameMessage;
-            GameRoom.OnDisconnect -= OnGameDisconnect;
-        }
-        GameRoom = null;
-        GameRoomId = null;
-    }
-
-    private bool _serviceReconnecting = false;
-    private async Task OnServiceDisconnectAsync(object sender, string reason)
-    {
-        if (_serviceReconnecting)
-            return;
-        _serviceReconnecting = true;
-        Log.ErrorLine($"Disconnected from the service room!");
-        var tries = 0;
-        DisposeGameRoom();
-        DisposeServiceRoom();
-        while (!IsOnServiceRoom)
-        {
-            try
-            {
-                await ConnectToServiceRoomAsync();
-                break;
-            }
-            catch (Exception ex)
-            {
-                var parts = ex.Message.Split('.');
-                Log.ErrorLine($"Failed to reconnect to the service room: {parts.FirstOrDefault("You broke it.")}");
-            }
-            
-            tries++;
-            if (tries >= MaxServiceReconnections)
-            {
-                tries = 0;
-                await Task.Delay(BiggerReconnectionCooldown);
-            }
-            else
-            {
-                await Task.Delay(NormalReconnectionCooldown);
-            }
-        }
-        _serviceReconnecting = false;
-    }
-    
-    private bool _gameReconnecting = false;
-    private async Task OnGameDisconnectAsync(object sender, string reason)
-    {
-        if (_gameReconnecting)
-            return;
-        _gameReconnecting = true;
-        Log.ErrorLine($"Disconnected from the game room!");
-        var tries = 0;
-        DisposeGameRoom();
-        while (!IsOnGameRoom)
-        {
-            try
-            {
-                await ConnectToGameRoomAsync();
-                break;
-            }
-            catch (Exception ex)
-            {
-                var parts = ex.Message.Split('.');
-                Log.ErrorLine($"Failed to reconnect to the game room: {parts.FirstOrDefault("You broke it.")}");
-            }
-            
-            tries++;
-            if (tries >= MaxGameReconnections)
-            {
-                tries = 0;
-                await Task.Delay(BiggerReconnectionCooldown);
-            }
-            else
-            {
-                await Task.Delay(NormalReconnectionCooldown);
-            }
-        }
-
-        _gameReconnecting = false;
-    }
-
-    public async Task<double> GetServerTimeAsync()
-    {
-        if (!IsOnServiceRoom)
-            throw new Exception("Couldn't get server time because the client was not on a service room.");
-
-        if (!IsOnGameRoom)
-            throw new Exception("Couldn't get server time because the client was not on a game room.");
-
-        var taskCompletionSource = new TaskCompletionSource<double>();
-        void RpcTime(object sender, Message m)
-        {
-            if (m.Type != "serverTime")
-                return;
-            taskCompletionSource.TrySetResult(m.GetDouble(0));
-            if (GameRoom is not null)
-                GameRoom.OnMessage -= RpcTime;
-        }
-
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(10000);
-            taskCompletionSource.TrySetCanceled();
-        });
+        if (CheckAuthenticated("Could not join suitable service room because client was not authenticated.") is { } ex)
+            throw ex;
+        var client = Client!;
         
-        GameRoom!.OnMessage += RpcTime;
-        GameRoom!.Send("timeRequest", Client!.ConnectUserId);
-        try
+        var rooms = (await GetServiceRoomsAsync())
+            .Where(room =>
+            {
+                if (room.RoomType != "service")
+                    return false;
+                var version = int.Parse(room.Id.Substring(8, 4));
+                return version >= ClientVersion;
+            })
+            .Select(room => (Index: int.Parse(room.Id.Substring(13, 1)), Room: room))
+            .ToDictionary(o => o.Index, o => o.Room);
+
+        Connection? connection = null;
+        Exception? roomJoinException = null;
+        if (rooms.Count == 0)
         {
-            return await taskCompletionSource.Task;
+            try
+            {
+                connection = await JoinServiceRoomAsync(0);
+            }
+            catch (Exception e)
+            {
+                Log.ErrorLine($"Failed to join service room: {GetServiceRoomId(0)}\n    {e.Message}");
+                roomJoinException = e;
+            }
         }
-        catch (TaskCanceledException)
+        else
         {
-            throw new TimeoutException("Failed to get server time because it resulted in a timeout.");
+            var joined = false;
+            var lastRoomIndex = rooms.Keys.Max(v => v);
+            foreach (var (index, room) in rooms)
+            {
+                if (room.OnlineUsers >= 40)
+                    continue;
+                try
+                {
+                    connection = await JoinServiceRoomAsync(index);
+                    joined = true;
+                    break;
+                }
+                catch (Exception e)
+                {
+                    Log.ErrorLine($"Failed to join service room: {room.Id}\n    {e.Message}");
+                    roomJoinException = e;
+                }
+            }
+
+            if (!joined)
+            {
+                try
+                {
+                    connection = await JoinServiceRoomAsync(lastRoomIndex + 1);
+                }
+                catch (Exception e)
+                {
+                    Log.ErrorLine($"Failed to join service room: {GetServiceRoomId(lastRoomIndex + 1)}\n    {e.Message}");
+                    roomJoinException = e;
+                }
+            }
         }
+
+        if (connection is not null) 
+            return connection;
+        
+        if (roomJoinException is not null)
+            throw roomJoinException;
+        
+        throw new Exception("Failed to join suitable service room.");
     }
 
+    public async Task<Connection> JoinServiceRoomAsync(int index)
+    {
+        if (CheckAuthenticated("Could not join service room because client was not authenticated.") is { } ex)
+            throw ex;
+        var client = Client!;
+        var roomId = GetServiceRoomId(index);
+        var connectionTask = new TaskCompletionSource<Connection>();
+        client.Multiplayer.CreateJoinRoom(
+            roomId,
+            "service",
+            true,
+            [],
+            new()
+            {
+                { "client_version", $"{ClientVersion}" },
+            },
+            connection =>
+            {
+                void OnRoomMessage(object sender, Message message)
+                {
+                    switch (message.Type)
+                    {
+                        case "error":
+                            connection.OnMessage -= OnRoomMessage;
+                            connection.OnDisconnect -= OnServiceDisconnect;
+                            connection.OnMessage -= OnServiceMessage;
+                            connection.Disconnect();
+                            connectionTask.TrySetException(new Exception(message.GetString(0)));
+                            return;
+                        case "groupdisallowedjoin":
+                            connection.OnMessage -= OnRoomMessage;
+                            connection.OnDisconnect -= OnServiceDisconnect;
+                            connection.OnMessage -= OnServiceMessage;
+                            connection.Disconnect();
+                            connectionTask.TrySetException(new Exception("Disallowed join!"));
+                            return;
+                        case "joined":
+                            connection.OnDisconnect += OnServiceDisconnect;
+                            connection.OnMessage += OnServiceMessage;
+                            OnServiceJoin(connection, message);
+                            connectionTask.TrySetResult(connection);
+                            return;
+                    }
+                }
+                connection.OnMessage += OnRoomMessage;
+            },
+            error =>
+            {
+                connectionTask.TrySetException(error);
+            }
+        );
+        return await connectionTask.Task;
+    }
+
+    public void OnServiceJoin(Connection connection, Message message)
+    {
+        Log.TraceLine(message);
+    }
+    
+    public void OnServiceMessage(object sender, Message message)
+    {
+        
+    }
+    
+    public void OnServiceDisconnect(object sender, string reason)
+    {
+        
+    }
+    #endregion
+    
     public void Dispose()
     {
         GC.SuppressFinalize(this);
-        ServiceRoom?.Disconnect();
         Client?.Logout();
     }
 }
